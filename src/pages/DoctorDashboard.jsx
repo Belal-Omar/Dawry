@@ -4,6 +4,7 @@ import Logo from '../components/Logo';
 import Icon from '../components/Icons';
 import ThemeToggle from '../components/ThemeToggle';
 import Modal from '../components/Modal';
+import PatientEMRModal from '../components/PatientEMRModal';
 
 export default function DoctorDashboard({
   doctorId = 1,
@@ -21,6 +22,7 @@ export default function DoctorDashboard({
   // 'overview' | 'appointments' | 'calendar' | 'queue' | 'patients' | 'schedule' | 'branches' | 'staff' | 'reports' | 'subscription' | 'settings'
   const [activeTab, setActiveTab] = useState('overview');
   const [loading, setLoading] = useState(true);
+  const [emrModal, setEmrModal] = useState({ isOpen: false, phone: '', name: '', appointmentId: null });
 
   // Core Data
   const [dashboardData, setDashboardData] = useState(null);
@@ -659,6 +661,21 @@ export default function DoctorDashboard({
                       📝 ملاحظات: {currentServing.appt_notes}
                     </div>
                   )}
+                  {currentServing.patient_phone && (
+                    <button
+                      type="button"
+                      className="btn primary small"
+                      style={{ marginTop: '10px', fontWeight: 700 }}
+                      onClick={() => setEmrModal({
+                        isOpen: true,
+                        phone: currentServing.patient_phone,
+                        name: currentServing.patient_name,
+                        appointmentId: currentServing.appointment_id || null
+                      })}
+                    >
+                      🩺 فتح الملف الطبي والتاريخ المرضي
+                    </button>
+                  )}
                 </div>
               ) : (
                 <div style={{ padding: '16px 0', color: 'var(--muted)', fontSize: '13px' }}>
@@ -1132,6 +1149,7 @@ export default function DoctorDashboard({
                   <th>آخر موعد كشف</th>
                   <th>الموعد القادم</th>
                   <th>الحالة</th>
+                  <th>السجل الطبي</th>
                 </tr>
               </thead>
               <tbody>
@@ -1145,6 +1163,16 @@ export default function DoctorDashboard({
                       <td>{p.last_visit_date || '2026-11-10'}</td>
                       <td><span style={{ color: 'var(--primary)', fontWeight: 600 }}>{p.upcoming_date || 'لا يوجد موعد'}</span></td>
                       <td><span className="badge badge-success">نشط</span></td>
+                      <td>
+                        <button
+                          type="button"
+                          className="btn primary small"
+                          style={{ fontSize: '11px', padding: '5px 10px' }}
+                          onClick={() => setEmrModal({ isOpen: true, phone: p.phone, name: p.name, appointmentId: null })}
+                        >
+                          🩺 التاريخ المرضي
+                        </button>
+                      </td>
                     </tr>
                   ))}
               </tbody>
@@ -1792,6 +1820,17 @@ export default function DoctorDashboard({
           </form>
         </Modal>
       )}
+
+      <PatientEMRModal
+        isOpen={emrModal.isOpen}
+        onClose={() => setEmrModal({ isOpen: false, phone: '', name: '', appointmentId: null })}
+        doctorId={doctorId}
+        doctorInfo={doctorInfo}
+        patientPhone={emrModal.phone}
+        patientName={emrModal.name}
+        appointmentId={emrModal.appointmentId}
+        showToast={showToast}
+      />
         </main>
       </div>
     </div>

@@ -6,18 +6,24 @@ import { fileURLToPath } from 'node:url';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// When deployed on Vercel Serverless, root is read-only so use /tmp
+// When deployed on Vercel Serverless, root is read-only so use /tmp;
+// On Render/Railway/VPS with persistent disk, set DAWRY_DB_PATH=/var/data/dawry.db
 const isVercel = Boolean(process.env.VERCEL);
-let DB_PATH = path.join(__dirname, 'dawry.db');
-if (isVercel) {
+let DB_PATH = process.env.DAWRY_DB_PATH || path.join(__dirname, 'dawry.db');
+if (isVercel && !process.env.DAWRY_DB_PATH) {
   const tmpDbPath = path.join('/tmp', 'dawry.db');
-  if (!fs.existsSync(tmpDbPath) && fs.existsSync(DB_PATH)) {
+  const bundledDb = path.join(__dirname, 'dawry.db');
+  if (!fs.existsSync(tmpDbPath) && fs.existsSync(bundledDb)) {
     try {
-      fs.copyFileSync(DB_PATH, tmpDbPath);
+      fs.copyFileSync(bundledDb, tmpDbPath);
     } catch (e) {}
   }
   DB_PATH = tmpDbPath;
 }
+try {
+  const dir = path.dirname(DB_PATH);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+} catch (e) {}
 
 export const db = new DatabaseSync(DB_PATH);
 
@@ -284,6 +290,76 @@ export function initDB() {
       blocked_by TEXT DEFAULT 'system',
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
+
+    -- 19. Patient Medical Profiles (EMR - Restricted to Treating Doctor & Patient)
+    CREATE TABLE IF NOT EXISTS patient_medical_profiles (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      doctor_id INTEGER NOT NULL REFERENCES doctors(id) ON DELETE CASCADE,
+      patient_phone TEXT NOT NULL,
+      patient_name TEXT,
+      blood_type TEXT DEFAULT 'غير محدد',
+      allergies TEXT DEFAULT 'لا توجد حساسية مسجلة',
+      chronic_conditions TEXT DEFAULT 'لا توجد',
+      past_surgeries TEXT DEFAULT 'لا توجد',
+      family_history TEXT DEFAULT '',
+      notes TEXT DEFAULT '',
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(doctor_id, patient_phone)
+    );
+
+    -- 20. Medical Visits & Vitals History (Progress Tracking)
+    CREATE TABLE IF NOT EXISTS medical_visits (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      doctor_id INTEGER NOT NULL REFERENCES doctors(id) ON DELETE CASCADE,
+      patient_phone TEXT NOT NULL,
+      appointment_id INTEGER REFERENCES appointments(id) ON DELETE SET NULL,
+      visit_date DATE NOT NULL,
+      chief_complaint TEXT NOT NULL,
+      diagnosis TEXT NOT NULL,
+      clinical_notes TEXT DEFAULT '',
+      bp_systolic INTEGER,
+      bp_diastolic INTEGER,
+      heart_rate INTEGER,
+      temperature REAL,
+      blood_sugar REAL,
+      weight_kg REAL,
+      improvement_score INTEGER DEFAULT 7, -- 1 to 10
+      follow_up_date DATE,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+
+    -- 21. Prescriptions & Medications
+    CREATE TABLE IF NOT EXISTS prescriptions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      visit_id INTEGER REFERENCES medical_visits(id) ON DELETE CASCADE,
+      doctor_id INTEGER NOT NULL REFERENCES doctors(id) ON DELETE CASCADE,
+      patient_phone TEXT NOT NULL,
+      medication_name TEXT NOT NULL,
+      dosage TEXT NOT NULL,
+      frequency TEXT NOT NULL,
+      duration TEXT NOT NULL,
+      instructions TEXT DEFAULT '',
+      is_active INTEGER DEFAULT 1,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+
+    -- 22. Lab & Radiology Results (Comparison Across Dates)
+    CREATE TABLE IF NOT EXISTS lab_results (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      doctor_id INTEGER NOT NULL REFERENCES doctors(id) ON DELETE CASCADE,
+      patient_phone TEXT NOT NULL,
+      visit_id INTEGER REFERENCES medical_visits(id) ON DELETE SET NULL,
+      test_name TEXT NOT NULL,
+      category TEXT DEFAULT 'تحليل دم',
+      numeric_value REAL,
+      unit TEXT DEFAULT '',
+      reference_range TEXT DEFAULT '',
+      status TEXT DEFAULT 'normal', -- normal, high, low, critical
+      result_text TEXT DEFAULT '',
+      attachment_url TEXT DEFAULT '',
+      test_date DATE NOT NULL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
   `);
 
   try {
@@ -320,6 +396,64 @@ export function initDB() {
       updateSpecIcon.run(specIcon, specName);
     }
   } catch (e) {}
+
+  seedEMRIfEmpty();
+}
+
+function seedEMRIfEmpty() {
+  try {
+    const doc1 = db.prepare('SELECT id FROM doctors ORDER BY id ASC LIMIT 1').get();
+    if (!doc1) return;
+    const cnt = db.prepare('SELECT COUNT(*) as c FROM medical_visits').get();
+    if (cnt && cnt.c > 0) return;
+
+    const phone = '01023456789';
+    const name = 'محمد نبيل عبدالعزيز';
+
+    db.prepare(`
+      INSERT OR IGNORE INTO patient_medical_profiles
+      (doctor_id, patient_phone, patient_name, blood_type, allergies, chronic_conditions, past_surgeries, family_history, notes)
+      VALUES (?, ?, ?, 'O+', 'حساسية من البنسلين', 'ارتفاع ضغط الدم، ارتفاع طفيف بالكوليسترول', 'لا توجد', 'تاريخ عائلي لضغط الدم', 'يستجيب بشكل ممتاز للعلاج والنظام الغذائي')
+    `).run(doc1.id, phone, name);
+
+    const d90 = new Date(Date.now() - 90 * 86400000).toISOString().split('T')[0];
+    const d45 = new Date(Date.now() - 45 * 86400000).toISOString().split('T')[0];
+    const d7  = new Date(Date.now() - 7  * 86400000).toISOString().split('T')[0];
+
+    const v1 = db.prepare(`
+      INSERT INTO medical_visits (doctor_id, patient_phone, visit_date, chief_complaint, diagnosis, clinical_notes, bp_systolic, bp_diastolic, heart_rate, temperature, blood_sugar, weight_kg, improvement_score)
+      VALUES (?, ?, ?, 'صداع متكرر وإجهاد مع مجهود بسيط', 'ارتفاع ضغط الدم من الدرجة الأولى', 'بدء خطة علاجية مع تقليل الصوديوم والمشي ٣٠ دقيقة يومياً', 156, 96, 88, 37.0, 118, 86.5, 4)
+    `).run(doc1.id, phone, d90);
+
+    const v2 = db.prepare(`
+      INSERT INTO medical_visits (doctor_id, patient_phone, visit_date, chief_complaint, diagnosis, clinical_notes, bp_systolic, bp_diastolic, heart_rate, temperature, blood_sugar, weight_kg, improvement_score)
+      VALUES (?, ?, ?, 'متابعة الضغط بعد ٦ أسابيع', 'استجابة جيدة للعلاج — ضغط مستقر نسبياً', 'اختفى الصداع وتحسن معدل النبض والوزن', 138, 86, 78, 36.8, 106, 83.0, 7)
+    `).run(doc1.id, phone, d45);
+
+    const v3 = db.prepare(`
+      INSERT INTO medical_visits (doctor_id, patient_phone, visit_date, chief_complaint, diagnosis, clinical_notes, bp_systolic, bp_diastolic, heart_rate, temperature, blood_sugar, weight_kg, improvement_score)
+      VALUES (?, ?, ?, 'متابعة دورية ومراجعة التحاليل', 'ضغط الدم منضبط بالكامل', 'استمرار الجرعة الوقائية مع متابعة كل ٣ أشهر', 124, 80, 72, 36.7, 96, 80.2, 9)
+    `).run(doc1.id, phone, d7);
+
+    const insRx = db.prepare(`
+      INSERT INTO prescriptions (visit_id, doctor_id, patient_phone, medication_name, dosage, frequency, duration, instructions, is_active)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    insRx.run(Number(v1.lastInsertRowid), doc1.id, phone, 'Concor 5mg (Bisoprolol)', '5 مجم', 'قرص صباحاً يومياً', 'شهر ونصف', 'يُؤخذ قبل الإفطار', 0);
+    insRx.run(Number(v2.lastInsertRowid), doc1.id, phone, 'Concor 2.5mg (Bisoprolol)', '2.5 مجم', 'قرص صباحاً يومياً', 'مستمر', 'تم تخفيض الجرعة بعد تحسن الضغط', 1);
+    insRx.run(Number(v3.lastInsertRowid), doc1.id, phone, 'Atorvastatin 10mg', '10 مجم', 'قرص مساءً يومياً', '٣ أشهر', 'بعد العشاء', 1);
+
+    const insLab = db.prepare(`
+      INSERT INTO lab_results (doctor_id, patient_phone, visit_id, test_name, category, numeric_value, unit, reference_range, status, result_text, test_date)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    insLab.run(doc1.id, phone, Number(v1.lastInsertRowid), 'LDL Cholesterol', 'تحليل دم', 162, 'mg/dL', '< 130', 'high', 'مرتفع عن الحد الطبيعي', d90);
+    insLab.run(doc1.id, phone, Number(v3.lastInsertRowid), 'LDL Cholesterol', 'تحليل دم', 114, 'mg/dL', '< 130', 'normal', 'انخفاض ممتاز وعودة للمعدل الطبيعي', d7);
+    insLab.run(doc1.id, phone, Number(v1.lastInsertRowid), 'السكر التراكمي HbA1c', 'تحليل دم', 6.3, '%', '4.0 - 5.6', 'high', 'مرحلة ما قبل السكري', d90);
+    insLab.run(doc1.id, phone, Number(v3.lastInsertRowid), 'السكر التراكمي HbA1c', 'تحليل دم', 5.5, '%', '4.0 - 5.6', 'normal', 'تحسن ملحوظ وعودة للمعدل الطبيعي', d7);
+  } catch (e) {
+    console.error('EMR seed error:', e.message);
+  }
 }
 
 // Seed Initial Data

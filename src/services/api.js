@@ -1,10 +1,29 @@
 const BASE_URL = '/api';
 
+export function getAuthToken() {
+  try {
+    return typeof window !== 'undefined' ? localStorage.getItem('dawry_auth_token') : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+export function setAuthToken(token) {
+  try {
+    if (typeof window !== 'undefined') {
+      if (token) localStorage.setItem('dawry_auth_token', token);
+      else localStorage.removeItem('dawry_auth_token');
+    }
+  } catch (e) {}
+}
+
 async function request(url, options = {}) {
   try {
+    const token = getAuthToken();
     const res = await fetch(`${BASE_URL}${url}`, {
       headers: {
         'Content-Type': 'application/json',
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
         ...options.headers
       },
       ...options
@@ -29,14 +48,31 @@ export const api = {
   createBooking: (bookingData) => request('/public/bookings', { method: 'POST', body: JSON.stringify(bookingData) }),
   trackBooking: (code) => request(`/public/bookings/track/${encodeURIComponent(code)}`),
   getMyBookings: (phone) => request(`/public/bookings/my${phone ? `?phone=${encodeURIComponent(phone)}` : ''}`),
-  cancelBooking: (code) => request(`/public/bookings/${encodeURIComponent(code)}/cancel`, { method: 'POST' }),
+  cancelBooking: (code, patientPhone) => request(`/public/bookings/${encodeURIComponent(code)}/cancel`, {
+    method: 'POST',
+    body: JSON.stringify({ patient_phone: patientPhone || (typeof window !== 'undefined' ? localStorage.getItem('dawry_patient_phone') || '' : '') })
+  }),
+  getMyEMR: () => request('/public/my-emr'),
 
   // Unified Auth & Patient Signup
-  login: (credentials) => request('/auth/login', { method: 'POST', body: JSON.stringify(credentials) }),
-  signupPatient: (data) => request('/auth/patient/signup', { method: 'POST', body: JSON.stringify(data) }),
+  login: async (credentials) => {
+    const res = await request('/auth/login', { method: 'POST', body: JSON.stringify(credentials) });
+    if (res && res.success && res.token) setAuthToken(res.token);
+    return res;
+  },
+  signupPatient: async (data) => {
+    const res = await request('/auth/patient/signup', { method: 'POST', body: JSON.stringify(data) });
+    if (res && res.success && res.token) setAuthToken(res.token);
+    return res;
+  },
+  logout: () => setAuthToken(null),
 
   // Doctor Auth
-  loginDoctor: (credentials) => request('/auth/doctor/login', { method: 'POST', body: JSON.stringify(credentials) }),
+  loginDoctor: async (credentials) => {
+    const res = await request('/auth/doctor/login', { method: 'POST', body: JSON.stringify(credentials) });
+    if (res && res.success && res.token) setAuthToken(res.token);
+    return res;
+  },
   getDoctorAuthList: () => request('/auth/doctor/list'),
 
   // Doctor Dashboard
@@ -64,8 +100,19 @@ export const api = {
   addDoctorBranch: (id, data) => request(`/doctor/${id}/branches`, { method: 'POST', body: JSON.stringify(data) }),
   updateDoctorSettings: (id, data) => request(`/doctor/${id}/settings`, { method: 'PUT', body: JSON.stringify(data) }),
 
+  // Doctor EMR (Medical History, Visits, Prescriptions & Labs Comparison)
+  getDoctorPatientEMR: (doctorId, phone) => request(`/doctor/${doctorId}/emr/patient/${encodeURIComponent(phone)}`),
+  updateDoctorPatientProfile: (doctorId, phone, data) => request(`/doctor/${doctorId}/emr/patient/${encodeURIComponent(phone)}/profile`, { method: 'PUT', body: JSON.stringify(data) }),
+  addDoctorMedicalVisit: (doctorId, phone, data) => request(`/doctor/${doctorId}/emr/patient/${encodeURIComponent(phone)}/visits`, { method: 'POST', body: JSON.stringify(data) }),
+  addDoctorLabResult: (doctorId, phone, data) => request(`/doctor/${doctorId}/emr/patient/${encodeURIComponent(phone)}/labs`, { method: 'POST', body: JSON.stringify(data) }),
+  toggleDoctorPrescription: (doctorId, prescId) => request(`/doctor/${doctorId}/emr/prescriptions/${prescId}/toggle`, { method: 'POST' }),
+
   // Receptionist Dashboard & Auth
-  loginReceptionist: (credentials) => request('/auth/receptionist/login', { method: 'POST', body: JSON.stringify(credentials) }),
+  loginReceptionist: async (credentials) => {
+    const res = await request('/auth/receptionist/login', { method: 'POST', body: JSON.stringify(credentials) });
+    if (res && res.success && res.token) setAuthToken(res.token);
+    return res;
+  },
   getReceptionistAuthList: () => request('/auth/receptionist/list'),
   getReceptionistDashboard: (id) => request(`/receptionist/${id}/dashboard`),
   getReceptionistQueue: (id, params = {}) => {
@@ -82,6 +129,7 @@ export const api = {
   receptionistCheckin: (recId, codeOrPhone) => request(`/receptionist/${recId}/checkin`, { method: 'POST', body: JSON.stringify({ code_or_phone: codeOrPhone }) }),
   searchReceptionistPatients: (recId, query) => request(`/receptionist/${recId}/patients/search?query=${encodeURIComponent(query)}`),
   getReceptionistNotifications: (recId) => request(`/receptionist/${recId}/notifications`),
+  logReceptionistWhatsapp: (recId, data) => request(`/receptionist/${recId}/whatsapp-log`, { method: 'POST', body: JSON.stringify(data) }),
   updateReceptionistProfile: (recId, data) => request(`/receptionist/${recId}/profile`, { method: 'PUT', body: JSON.stringify(data) }),
 
   // Super Admin Dashboard

@@ -4,6 +4,7 @@ import Logo from '../components/Logo';
 import Icon from '../components/Icons';
 import ThemeToggle from '../components/ThemeToggle';
 import Modal from '../components/Modal';
+import WhatsAppModal from '../components/WhatsAppModal';
 
 export default function ReceptionistDashboard({
   receptionistId = 1,
@@ -19,6 +20,30 @@ export default function ReceptionistDashboard({
   // 'dashboard' | 'appointments' | 'queue' | 'walkin' | 'search' | 'notifications' | 'settings'
   const [activeTab, setActiveTab] = useState('queue');
   const [loading, setLoading] = useState(true);
+  const [waModal, setWaModal] = useState({ isOpen: false, context: null });
+
+  const openWhatsappForPatient = ({ patientName, patientPhone, queueNumber, appointmentDate, appointmentTime, bookingCode }) => {
+    const docName = dashboardData?.receptionist?.doctor_name || receptionist?.doctor_name || 'الطبيب';
+    const clinicName = dashboardData?.receptionist?.clinic_name || receptionist?.clinic_name || 'العيادة';
+    const currentServingNum = queueState?.current_serving_number || 0;
+    const aheadCount = queueNumber ? Math.max(0, Number(queueNumber) - Number(currentServingNum) - 1) : 0;
+    setWaModal({
+      isOpen: true,
+      context: {
+        patientName,
+        patientPhone,
+        doctorName: docName,
+        clinicName,
+        queueNumber,
+        currentServing: currentServingNum || '—',
+        patientsAhead: aheadCount,
+        appointmentDate,
+        appointmentTime,
+        bookingCode,
+        delayMinutes: queueState?.delay_minutes || 15
+      }
+    });
+  };
 
   // Core Data
   const [dashboardData, setData] = useState(null);
@@ -865,6 +890,20 @@ export default function ReceptionistDashboard({
                         >
                           تخطي
                         </button>
+                        <button
+                          type="button"
+                          className="btn small"
+                          onClick={() => openWhatsappForPatient({
+                            patientName: currentServing.patient_name,
+                            patientPhone: currentServing.patient_phone,
+                            queueNumber: currentServing.queue_number,
+                            bookingCode: currentServing.booking_code
+                          })}
+                          style={{ background: '#25D366', color: '#fff', border: 'none', fontWeight: 700 }}
+                          title="مراسلة المريض عبر واتساب"
+                        >
+                          💬 واتساب
+                        </button>
                       </div>
                     </div>
                   ) : (
@@ -1182,6 +1221,22 @@ export default function ReceptionistDashboard({
                                     title="تعديل وقت الموعد"
                                   >
                                     تعديل
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="btn small"
+                                    onClick={() => openWhatsappForPatient({
+                                      patientName: appt.patient_name,
+                                      patientPhone: appt.patient_phone,
+                                      queueNumber: appt.queue_number,
+                                      appointmentDate: appt.appointment_date,
+                                      appointmentTime: appt.appointment_time,
+                                      bookingCode: appt.booking_code
+                                    })}
+                                    style={{ background: '#25D366', color: '#fff', border: 'none', padding: '5px 9px', fontSize: '11px', fontWeight: 700 }}
+                                    title="إرسال رسالة واتساب جاهزة للمريض"
+                                  >
+                                    💬 واتساب
                                   </button>
 
                                   {appt.status !== 'cancelled' && appt.status !== 'completed' && (
@@ -1568,6 +1623,22 @@ export default function ReceptionistDashboard({
                                     </button>
                                   )}
 
+                                  <button
+                                    type="button"
+                                    className="btn small"
+                                    onClick={() => openWhatsappForPatient({
+                                      patientName: entry.patient_name,
+                                      patientPhone: entry.patient_phone,
+                                      queueNumber: entry.queue_number,
+                                      appointmentTime: entry.appointment_time,
+                                      bookingCode: entry.booking_code
+                                    })}
+                                    style={{ background: '#25D366', color: '#fff', border: 'none', padding: '4px 9px', fontSize: '11px', fontWeight: 700 }}
+                                    title="إبلاغ المريض بدوره عبر واتساب"
+                                  >
+                                    💬 واتساب
+                                  </button>
+
                                   {/* Remove Invalid Entry */}
                                   {!isDone && (
                                     <button
@@ -1905,6 +1976,7 @@ export default function ReceptionistDashboard({
                           <th style={{ padding: '12px 16px' }}>تاريخ آخر زيارة</th>
                           <th style={{ padding: '12px 16px' }}>كود آخر حجز</th>
                           <th style={{ padding: '12px 16px' }}>حالة الحجز</th>
+                          <th style={{ padding: '12px 16px' }}>تواصل</th>
                         </tr>
                       </thead>
                       <tbody>
@@ -1917,6 +1989,20 @@ export default function ReceptionistDashboard({
                             <td style={{ padding: '12px 16px', fontFamily: 'monospace', fontWeight: 600 }}>{pat.last_booking_code}</td>
                             <td style={{ padding: '12px 16px' }}>
                               <span className="badge badge-primary">{pat.last_status || 'مكتمل'}</span>
+                            </td>
+                            <td style={{ padding: '12px 16px' }}>
+                              <button
+                                type="button"
+                                className="btn small"
+                                onClick={() => openWhatsappForPatient({
+                                  patientName: pat.patient_name,
+                                  patientPhone: pat.patient_phone,
+                                  bookingCode: pat.last_booking_code
+                                })}
+                                style={{ background: '#25D366', color: '#fff', border: 'none', padding: '5px 10px', fontSize: '11px', fontWeight: 700 }}
+                              >
+                                💬 واتساب
+                              </button>
                             </td>
                           </tr>
                         ))}
@@ -2167,6 +2253,16 @@ export default function ReceptionistDashboard({
           </form>
         </Modal>
       )}
+
+      <WhatsAppModal
+        isOpen={waModal.isOpen}
+        onClose={() => setWaModal({ isOpen: false, context: null })}
+        context={waModal.context}
+        onSent={async (payload) => {
+          await api.logReceptionistWhatsapp(receptionistId, payload);
+          showToast?.('تم فتح واتساب وتوثيق الرسالة في سجل الإشعارات', 'success');
+        }}
+      />
     </div>
   );
 }

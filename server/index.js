@@ -1,6 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import QRCode from 'qrcode';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -46,6 +47,138 @@ app.use(cors());
 app.use(express.json({ limit: '25mb' }));
 app.use(express.urlencoded({ extended: true, limit: '25mb' }));
 app.use('/uploads', express.static(uploadsPath));
+
+// ----------------------------------------------------
+// SECURITY HARDENING: PASSWORD HASHING, SIGNED TOKENS & RBAC
+// ----------------------------------------------------
+const JWT_SECRET = process.env.JWT_SECRET || 'dawry_dev_secret_change_in_prod_2026';
+
+export function hashPassword(plain) {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const derived = crypto.scryptSync(String(plain), salt, 64).toString('hex');
+  return `scrypt$${salt}$${derived}`;
+}
+
+export function verifyPassword(plain, stored) {
+  const input = String(plain || '');
+  const saved = String(stored || '');
+  if (!saved) return false;
+  if (saved.startsWith('scrypt$')) {
+    const [, salt, hex] = saved.split('$');
+    if (!salt || !hex) return false;
+    const derived = crypto.scryptSync(input, salt, 64);
+    const expected = Buffer.from(hex, 'hex');
+    if (derived.length !== expected.length) return false;
+    return crypto.timingSafeEqual(derived, expected);
+  }
+  return input === saved;
+}
+
+export function generateAuthToken(payload) {
+  const header = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url');
+  const exp = Date.now() + 14 * 24 * 3600 * 1000;
+  const data = Buffer.from(JSON.stringify({ ...payload, exp })).toString('base64url');
+  const sig = crypto.createHmac('sha256', JWT_SECRET).update(`${header}.${data}`).digest('base64url');
+  return `${header}.${data}.${sig}`;
+}
+
+export function verifyAuthToken(token) {
+  if (!token || typeof token !== 'string') return null;
+  const parts = token.split('.');
+  if (parts.length !== 3) return null;
+  const [header, data, sig] = parts;
+  const expectedSig = crypto.createHmac('sha256', JWT_SECRET).update(`${header}.${data}`).digest('base64url');
+  const sigBuf = Buffer.from(sig);
+  const expBuf = Buffer.from(expectedSig);
+  if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) return null;
+  try {
+    const payload = JSON.parse(Buffer.from(data, 'base64url').toString('utf8'));
+    if (payload.exp && payload.exp < Date.now()) return null;
+    return payload;
+  } catch (e) {
+    return null;
+  }
+}
+
+// Global Auth Token Middleware
+app.use((req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = (authHeader && authHeader.startsWith('Bearer '))
+    ? authHeader.slice(7)
+    : (req.headers['x-auth-token'] || null);
+  if (token) {
+    const user = verifyAuthToken(token);
+    if (user) req.user = user;
+  }
+  next();
+});
+
+// Strict Multi-Tenancy Guard: Doctor Workspace (/api/doctor/:id/*)
+function requireDoctorAccess(req, res, next) {
+  const requestedDocId = Number(req.params.id);
+  if (!req.user) {
+    return res.status(401).json({ success: false, message: 'يرجى تسجيل الدخول للوصول إلى لوحة الطبيب' });
+  }
+  if (req.user.role === 'admin') return next();
+  if (req.user.role === 'doctor' && Number(req.user.doctorId) === requestedDocId) return next();
+  if (req.user.role === 'reception' && Number(req.user.doctorId) === requestedDocId) return next();
+  return res.status(403).json({
+    success: false,
+    message: 'وصول محظور: غير مصرح لك بالاطلاع أو التعديل على بيانات عيادة أخرى'
+  });
+}
+
+// Strict EMR Guard: ONLY the treating Doctor can read/write diagnoses, labs & prescriptions
+function requireStrictDoctorEMR(req, res, next) {
+  const requestedDocId = Number(req.params.id);
+  if (!req.user) {
+    return res.status(401).json({ success: false, message: 'يرجى تسجيل الدخول بحساب الطبيب' });
+  }
+  if (req.user.role === 'doctor' && Number(req.user.doctorId) === requestedDocId) {
+    return next();
+  }
+  return res.status(403).json({
+    success: false,
+    message: 'سجل المريض الطبي محصور بالطبيب المعالج فقط حفاظاً على السرية الطبية'
+  });
+}
+
+// Strict Multi-Tenancy Guard: Receptionist Workspace (/api/receptionist/:id/*)
+function requireReceptionistAccess(req, res, next) {
+  const requestedRecId = Number(req.params.id);
+  if (!req.user) {
+    return res.status(401).json({ success: false, message: 'يرجى تسجيل الدخول للوصول إلى مكتب الاستقبال' });
+  }
+  if (req.user.role === 'admin') return next();
+  if (req.user.role === 'reception' && Number(req.user.id) === requestedRecId) return next();
+  if (req.user.role === 'doctor') {
+    const rec = db.prepare('SELECT doctor_id FROM receptionists WHERE id = ?').get(requestedRecId);
+    if (rec && Number(rec.doctor_id) === Number(req.user.doctorId)) return next();
+  }
+  return res.status(403).json({
+    success: false,
+    message: 'وصول محظور: غير مصرح لك بإدارة مكتب استقبال آخر'
+  });
+}
+
+// Strict Guard: Super Admin Only (/api/admin/*)
+function requireAdminAccess(req, res, next) {
+  if (!req.user) {
+    return res.status(401).json({ success: false, message: 'يرجى تسجيل الدخول بحساب مدير المنصة' });
+  }
+  if (req.user.role !== 'admin') {
+    return res.status(403).json({
+      success: false,
+      message: 'وصول محظور: هذه العمليات خاصة بإدارة المنصة العليا فقط'
+    });
+  }
+  next();
+}
+
+app.use('/api/doctor/:id/emr', requireStrictDoctorEMR);
+app.use('/api/doctor/:id', requireDoctorAccess);
+app.use('/api/receptionist/:id', requireReceptionistAccess);
+app.use('/api/admin', requireAdminAccess);
 
 // Upload Image Endpoint
 app.post('/api/upload', (req, res) => {
@@ -252,7 +385,8 @@ app.post(['/api/auth/unified-login', '/api/auth/login'], (req, res) => {
     const lowerId = cleanId.toLowerCase();
 
     // 4. Super Admin Check
-    if ((lowerId === 'admin@dawry.com' || lowerId === 'admin') && (cleanPass === 'admin123' || cleanPass === '123456')) {
+    const adminPassword = process.env.ADMIN_PASSWORD || 'admin123';
+    if ((lowerId === 'admin@dawry.com' || lowerId === 'admin') && cleanPass === adminPassword) {
       clearFailedAttempt(ip);
       clearFailedAttempt(cleanId);
       logAudit('superadmin', 'مدير المنصة', 'تسجيل دخول الأدمن', 'admin', 1, 'دخول ناجح للوحة الإدارة العليا');
@@ -264,8 +398,10 @@ app.post(['/api/auth/unified-login', '/api/auth/login'], (req, res) => {
         risk_score: 0,
         details: 'دخول ناجح لمدير المنصة (Super Admin).'
       });
+      const token = generateAuthToken({ id: 1, role: 'admin', name: 'مدير المنصة', email: 'admin@dawry.com' });
       return res.json({
         success: true,
+        token,
         role: 'admin',
         message: 'مرحباً بك في لوحة الإدارة العليا',
         user: { name: 'مدير المنصة', email: 'admin@dawry.com', role: 'admin' },
@@ -285,9 +421,13 @@ app.post(['/api/auth/unified-login', '/api/auth/login'], (req, res) => {
 
     if (doctor) {
       const docPass = doctor.password || '123456';
-      if (cleanPass === docPass || cleanPass === '123456') {
+      if (verifyPassword(cleanPass, docPass)) {
         if (doctor.status === 'suspended') {
           return res.status(403).json({ success: false, message: 'تم إيقاف هذا الحساب مؤقتاً، يرجى التواصل مع إدارة منصة دُوري.' });
+        }
+        // Seamless migration to scrypt hash if stored plaintext
+        if (!String(docPass).startsWith('scrypt$')) {
+          try { db.prepare('UPDATE doctors SET password = ? WHERE id = ?').run(hashPassword(cleanPass), doctor.id); } catch (e) {}
         }
         clearFailedAttempt(ip);
         clearFailedAttempt(cleanId);
@@ -300,8 +440,10 @@ app.post(['/api/auth/unified-login', '/api/auth/login'], (req, res) => {
           risk_score: 0,
           details: `دخول ناجح للطبيب: د. ${doctor.full_name}`
         });
+        const token = generateAuthToken({ id: doctor.id, doctorId: doctor.id, role: 'doctor', name: doctor.full_name, email: doctor.email });
         return res.json({
           success: true,
+          token,
           role: 'doctor',
           message: `مرحباً بك د. ${doctor.full_name}`,
           user: {
@@ -332,9 +474,12 @@ app.post(['/api/auth/unified-login', '/api/auth/login'], (req, res) => {
 
     if (rec) {
       const recPass = rec.password || '123456';
-      if (cleanPass === recPass || cleanPass === '123456') {
+      if (verifyPassword(cleanPass, recPass)) {
         if (rec.status !== 'active') {
           return res.status(403).json({ success: false, message: 'تم إيقاف حساب موظف الاستقبال، يرجى مراجعة إدارة العيادة.' });
+        }
+        if (!String(recPass).startsWith('scrypt$')) {
+          try { db.prepare('UPDATE receptionists SET password = ? WHERE id = ?').run(hashPassword(cleanPass), rec.id); } catch (e) {}
         }
         clearFailedAttempt(ip);
         clearFailedAttempt(cleanId);
@@ -347,11 +492,14 @@ app.post(['/api/auth/unified-login', '/api/auth/login'], (req, res) => {
           risk_score: 0,
           details: `دخول ناجح لموظف الاستقبال: ${rec.name}`
         });
+        const { password: _rp, ...safeRec } = rec;
+        const token = generateAuthToken({ id: rec.id, receptionistId: rec.id, doctorId: rec.doctor_id, branchId: rec.branch_id, role: 'reception', name: rec.name, email: rec.email });
         return res.json({
           success: true,
+          token,
           role: 'reception',
           message: `مرحباً بك ${rec.name}`,
-          user: rec,
+          user: safeRec,
           redirect: '#reception'
         });
       }
@@ -364,7 +512,10 @@ app.post(['/api/auth/unified-login', '/api/auth/login'], (req, res) => {
 
     if (patient) {
       const patientPass = patient.password || '123456';
-      if (cleanPass === patientPass || cleanPass === '123456') {
+      if (verifyPassword(cleanPass, patientPass)) {
+        if (!String(patientPass).startsWith('scrypt$')) {
+          try { db.prepare('UPDATE patients SET password = ? WHERE id = ?').run(hashPassword(cleanPass), patient.id); } catch (e) {}
+        }
         clearFailedAttempt(ip);
         clearFailedAttempt(cleanId);
         logSecurityEvent({
@@ -375,22 +526,25 @@ app.post(['/api/auth/unified-login', '/api/auth/login'], (req, res) => {
           risk_score: 0,
           details: `دخول مريض: ${patient.name}`
         });
+        const { password: _pp, ...safePatient } = patient;
+        const token = generateAuthToken({ id: patient.id, role: 'patient', name: patient.name, phone: patient.phone });
         return res.json({
           success: true,
+          token,
           role: 'patient',
           message: `أهلاً بك مجدداً ${patient.name}`,
-          user: patient,
+          user: safePatient,
           redirect: '#home'
         });
       }
     } else {
-      // Check if phone has appointments
+      // Check if phone has appointments (first-time login)
       const appt = db.prepare('SELECT patient_name, patient_phone FROM appointments WHERE patient_phone = ? ORDER BY id DESC LIMIT 1').get(cleanId);
-      if (appt && (cleanPass === '123456' || cleanPass.length >= 6)) {
+      if (appt && cleanPass.length >= 6) {
         clearFailedAttempt(ip);
         clearFailedAttempt(cleanId);
-        const newP = db.prepare('INSERT INTO patients (name, phone, password) VALUES (?, ?, ?)').run(appt.patient_name, appt.patient_phone, cleanPass);
-        const savedPatient = db.prepare('SELECT * FROM patients WHERE id = ?').get(newP.lastInsertRowid);
+        const newP = db.prepare('INSERT INTO patients (name, phone, password) VALUES (?, ?, ?)').run(appt.patient_name, appt.patient_phone, hashPassword(cleanPass));
+        const savedPatient = db.prepare('SELECT id, name, phone, email, city, gender, birth_year, created_at FROM patients WHERE id = ?').get(newP.lastInsertRowid);
         logSecurityEvent({
           event_type: 'login_success',
           req,
@@ -399,8 +553,10 @@ app.post(['/api/auth/unified-login', '/api/auth/login'], (req, res) => {
           risk_score: 0,
           details: `دخول مريض تلقائي برقم الحجز: ${appt.patient_name}`
         });
+        const token = generateAuthToken({ id: savedPatient.id, role: 'patient', name: savedPatient.name, phone: savedPatient.phone });
         return res.json({
           success: true,
+          token,
           role: 'patient',
           message: `أهلاً بك ${appt.patient_name}`,
           user: savedPatient,
@@ -509,9 +665,9 @@ app.post('/api/auth/patient/signup', (req, res) => {
     const insRes = db.prepare(`
       INSERT INTO patients (name, phone, email, password, city)
       VALUES (?, ?, ?, ?, ?)
-    `).run(name.trim(), cleanPhone, cleanEmail || null, cleanPass, city || 'القاهرة');
+    `).run(name.trim(), cleanPhone, cleanEmail || null, hashPassword(cleanPass), city || 'القاهرة');
 
-    const newPatient = db.prepare('SELECT * FROM patients WHERE id = ?').get(insRes.lastInsertRowid);
+    const newPatient = db.prepare('SELECT id, name, phone, email, city, gender, birth_year, created_at FROM patients WHERE id = ?').get(insRes.lastInsertRowid);
 
     logAudit('patient', name, 'إنشاء حساب مريض جديد', 'patient', newPatient.id, `تسجيل مريض جديد: ${name} (${cleanPhone})`);
     logSecurityEvent({
@@ -523,8 +679,10 @@ app.post('/api/auth/patient/signup', (req, res) => {
       details: `تسجيل مريض جديد بنجاح: ${name} (${cleanPhone})`
     });
 
+    const token = generateAuthToken({ id: newPatient.id, role: 'patient', name: newPatient.name, phone: newPatient.phone });
     res.json({
       success: true,
+      token,
       message: 'تم إنشاء الحساب بنجاح! مرحباً بك في منصة دُوري.',
       user: newPatient,
       role: 'patient',
@@ -569,7 +727,7 @@ app.post('/api/auth/doctor/login', (req, res) => {
       return res.status(401).json({ success: false, message: 'بيانات الدخول غير صحيحة. يرجى التحقق من البريد أو الهاتف.' });
     }
 
-    if (password && doctor.password && doctor.password !== password) {
+    if (doctor.password && !verifyPassword(password || '', doctor.password)) {
       return res.status(401).json({ success: false, message: 'كلمة المرور غير صحيحة. يرجى إعادة المحاولة.' });
     }
 
@@ -578,9 +736,11 @@ app.post('/api/auth/doctor/login', (req, res) => {
     }
 
     logAudit('doctor', doctor.full_name, 'تسجيل دخول طبيب', 'doctor', doctor.id, `تسجيل دخول ناجح لحساب ${doctor.full_name}`);
+    const token = generateAuthToken({ id: doctor.id, doctorId: doctor.id, role: 'doctor', name: doctor.full_name, email: doctor.email });
 
     res.json({
       success: true,
+      token,
       message: 'تم تسجيل الدخول بنجاح',
       doctor: {
         id: doctor.id,
@@ -1222,13 +1382,25 @@ app.get('/api/public/bookings/track/:code', (req, res) => {
   }
 });
 
-// 7. Cancel Booking by Patient
+// 7. Cancel Booking by Patient (Protected by phone ownership or authenticated user)
 app.post('/api/public/bookings/:code/cancel', (req, res) => {
   try {
     const code = req.params.code;
     const appt = db.prepare('SELECT * FROM appointments WHERE booking_code = ?').get(code);
     if (!appt) {
       return res.status(404).json({ success: false, message: 'الحجز غير موجود' });
+    }
+
+    const suppliedPhone = String(req.body?.patient_phone || req.query?.phone || '').trim();
+    const isStaffOrAdmin = req.user && (
+      req.user.role === 'admin' ||
+      ((req.user.role === 'doctor' || req.user.role === 'reception') && Number(req.user.doctorId) === Number(appt.doctor_id))
+    );
+    const isAuthedPatient = req.user && req.user.role === 'patient' && req.user.phone === appt.patient_phone;
+    const isPhoneMatch = suppliedPhone && suppliedPhone === appt.patient_phone;
+
+    if (!isStaffOrAdmin && !isAuthedPatient && !isPhoneMatch) {
+      return res.status(403).json({ success: false, message: 'يرجى تأكيد رقم الهاتف المسجل بالحجز لإتمام الإلغاء' });
     }
 
     db.prepare("UPDATE appointments SET status = 'cancelled' WHERE id = ?").run(appt.id);
@@ -1865,16 +2037,23 @@ app.post('/api/auth/receptionist/login', (req, res) => {
       return res.status(401).json({ success: false, message: 'بيانات الدخول غير صحيحة. يرجى التأكد من البريد أو الهاتف.' });
     }
 
+    if (rec.password && password && !verifyPassword(password, rec.password)) {
+      return res.status(401).json({ success: false, message: 'كلمة المرور غير صحيحة.' });
+    }
+
     if (rec.status !== 'active') {
       return res.status(403).json({ success: false, message: 'تم إيقاف حساب موظف الاستقبال، يرجى التواصل مع إدارة العيادة.' });
     }
 
     logAudit('receptionist', rec.name, 'تسجيل دخول موظف استقبال', 'receptionist', rec.id, `تسجيل دخول ناجح للموظف ${rec.name} بعيادة ${rec.clinic_name}`);
+    const { password: _rp, ...safeRec } = rec;
+    const token = generateAuthToken({ id: rec.id, receptionistId: rec.id, doctorId: rec.doctor_id, branchId: rec.branch_id, role: 'reception', name: rec.name, email: rec.email });
 
     res.json({
       success: true,
+      token,
       message: 'تم تسجيل الدخول بنجاح',
-      receptionist: rec
+      receptionist: safeRec
     });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
@@ -3436,6 +3615,324 @@ app.post('/api/admin/security/unblock', (req, res) => {
     db.prepare('DELETE FROM blocked_identifiers WHERE value = ?').run(value.trim());
     logAudit('superadmin', 'مدير المنصة', 'إلغاء حظر هوية', 'security', 0, `إلغاء حظر: ${value}`);
     res.json({ success: true, message: `تم فك حظر ${value} بنجاح.` });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ----------------------------------------------------
+// ELECTRONIC MEDICAL RECORD (EMR) & PROGRESS COMPARISON APIS
+// Strictly Restricted to the Treating Doctor & the Patient
+// ----------------------------------------------------
+
+function buildEMRBundle(docId, phone) {
+  const cleanPhone = String(phone || '').trim();
+  let profile = db.prepare(`
+    SELECT * FROM patient_medical_profiles WHERE doctor_id = ? AND patient_phone = ?
+  `).get(docId, cleanPhone);
+
+  if (!profile) {
+    const pat = db.prepare('SELECT patient_name FROM appointments WHERE doctor_id = ? AND patient_phone = ? ORDER BY id DESC LIMIT 1').get(docId, cleanPhone);
+    profile = {
+      doctor_id: Number(docId),
+      patient_phone: cleanPhone,
+      patient_name: pat?.patient_name || 'مريض',
+      blood_type: 'غير محدد',
+      allergies: 'لا توجد حساسية مسجلة',
+      chronic_conditions: 'لا توجد',
+      past_surgeries: 'لا توجد',
+      family_history: '',
+      notes: ''
+    };
+  }
+
+  const visits = db.prepare(`
+    SELECT * FROM medical_visits
+    WHERE doctor_id = ? AND patient_phone = ?
+    ORDER BY visit_date DESC, id DESC
+  `).all(docId, cleanPhone);
+
+  const prescriptions = db.prepare(`
+    SELECT p.*, v.visit_date
+    FROM prescriptions p
+    LEFT JOIN medical_visits v ON p.visit_id = v.id
+    WHERE p.doctor_id = ? AND p.patient_phone = ?
+    ORDER BY p.is_active DESC, p.created_at DESC, p.id DESC
+  `).all(docId, cleanPhone);
+
+  const labs = db.prepare(`
+    SELECT * FROM lab_results
+    WHERE doctor_id = ? AND patient_phone = ?
+    ORDER BY test_date DESC, id DESC
+  `).all(docId, cleanPhone);
+
+  // Build lab comparisons grouped by test_name (latest vs previous)
+  const labsByName = new Map();
+  for (const l of labs) {
+    const key = String(l.test_name || '').trim();
+    if (!labsByName.has(key)) labsByName.set(key, []);
+    labsByName.get(key).push(l);
+  }
+  const lab_comparisons = [];
+  for (const [testName, items] of labsByName.entries()) {
+    const latest = items[0];
+    const previous = items[1] || null;
+    const delta = (latest && previous && latest.numeric_value != null && previous.numeric_value != null)
+      ? Number((latest.numeric_value - previous.numeric_value).toFixed(2))
+      : null;
+    lab_comparisons.push({
+      test_name: testName,
+      category: latest.category,
+      unit: latest.unit,
+      reference_range: latest.reference_range,
+      latest,
+      previous,
+      delta,
+      history_count: items.length
+    });
+  }
+
+  // Build vitals progress summary (first vs latest visit)
+  const chronological = [...visits].reverse();
+  const firstVisit = chronological[0] || null;
+  const latestVisit = visits[0] || null;
+  const progress_summary = {
+    total_visits: visits.length,
+    first_visit_date: firstVisit?.visit_date || null,
+    latest_visit_date: latestVisit?.visit_date || null,
+    bp_first: firstVisit?.bp_systolic ? `${firstVisit.bp_systolic}/${firstVisit.bp_diastolic || ''}` : null,
+    bp_latest: latestVisit?.bp_systolic ? `${latestVisit.bp_systolic}/${latestVisit.bp_diastolic || ''}` : null,
+    sugar_first: firstVisit?.blood_sugar ?? null,
+    sugar_latest: latestVisit?.blood_sugar ?? null,
+    weight_first: firstVisit?.weight_kg ?? null,
+    weight_latest: latestVisit?.weight_kg ?? null,
+    improvement_first: firstVisit?.improvement_score ?? null,
+    improvement_latest: latestVisit?.improvement_score ?? null
+  };
+
+  return { profile, visits, chronological_visits: chronological, prescriptions, labs, lab_comparisons, progress_summary };
+}
+
+// 1. Get Patient Full EMR (Doctor Only)
+app.get('/api/doctor/:id/emr/patient/:phone', (req, res) => {
+  try {
+    const docId = Number(req.params.id);
+    const phone = decodeURIComponent(req.params.phone || '').trim();
+    if (!phone) return res.status(400).json({ success: false, message: 'رقم هاتف المريض مطلوب' });
+    const bundle = buildEMRBundle(docId, phone);
+    logAudit('doctor', `طبيب رقم ${docId}`, 'الاطلاع على السجل الطبي', 'emr', 0, `ملف المريض ${phone}`);
+    res.json({ success: true, ...bundle });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// 2. Update Patient Medical Profile (Allergies, Chronic Conditions, Blood Type)
+app.put('/api/doctor/:id/emr/patient/:phone/profile', (req, res) => {
+  try {
+    const docId = Number(req.params.id);
+    const phone = decodeURIComponent(req.params.phone || '').trim();
+    const { patient_name, blood_type, allergies, chronic_conditions, past_surgeries, family_history, notes } = req.body;
+
+    db.prepare(`
+      INSERT INTO patient_medical_profiles (doctor_id, patient_phone, patient_name, blood_type, allergies, chronic_conditions, past_surgeries, family_history, notes, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+      ON CONFLICT(doctor_id, patient_phone) DO UPDATE SET
+        patient_name = COALESCE(excluded.patient_name, patient_medical_profiles.patient_name),
+        blood_type = excluded.blood_type,
+        allergies = excluded.allergies,
+        chronic_conditions = excluded.chronic_conditions,
+        past_surgeries = excluded.past_surgeries,
+        family_history = excluded.family_history,
+        notes = excluded.notes,
+        updated_at = CURRENT_TIMESTAMP
+    `).run(
+      docId,
+      phone,
+      patient_name || null,
+      blood_type || 'غير محدد',
+      allergies || 'لا توجد حساسية مسجلة',
+      chronic_conditions || 'لا توجد',
+      past_surgeries || 'لا توجد',
+      family_history || '',
+      notes || ''
+    );
+
+    logAudit('doctor', `طبيب رقم ${docId}`, 'تحديث التاريخ المرضي الأساسي', 'emr', 0, `المريض ${phone}`);
+    res.json({ success: true, message: 'تم حفظ التاريخ المرضي الأساسي بنجاح', ...buildEMRBundle(docId, phone) });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// 3. Add Medical Visit + Prescriptions (Atomic)
+app.post('/api/doctor/:id/emr/patient/:phone/visits', (req, res) => {
+  try {
+    const docId = Number(req.params.id);
+    const phone = decodeURIComponent(req.params.phone || '').trim();
+    const {
+      patient_name, appointment_id, visit_date, chief_complaint, diagnosis, clinical_notes,
+      bp_systolic, bp_diastolic, heart_rate, temperature, blood_sugar, weight_kg,
+      improvement_score, follow_up_date, prescriptions = []
+    } = req.body;
+
+    if (!chief_complaint || !diagnosis) {
+      return res.status(400).json({ success: false, message: 'الشكوى الرئيسية والتشخيص حقول مطلوبة' });
+    }
+
+    // Ensure profile exists
+    db.prepare(`
+      INSERT OR IGNORE INTO patient_medical_profiles (doctor_id, patient_phone, patient_name)
+      VALUES (?, ?, ?)
+    `).run(docId, phone, patient_name || 'مريض');
+
+    const vDate = visit_date || new Date().toISOString().split('T')[0];
+    const vRes = db.prepare(`
+      INSERT INTO medical_visits (
+        doctor_id, patient_phone, appointment_id, visit_date, chief_complaint, diagnosis, clinical_notes,
+        bp_systolic, bp_diastolic, heart_rate, temperature, blood_sugar, weight_kg, improvement_score, follow_up_date
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      docId, phone, appointment_id || null, vDate, chief_complaint.trim(), diagnosis.trim(), clinical_notes || '',
+      bp_systolic ? Number(bp_systolic) : null,
+      bp_diastolic ? Number(bp_diastolic) : null,
+      heart_rate ? Number(heart_rate) : null,
+      temperature ? Number(temperature) : null,
+      blood_sugar ? Number(blood_sugar) : null,
+      weight_kg ? Number(weight_kg) : null,
+      improvement_score ? Number(improvement_score) : 7,
+      follow_up_date || null
+    );
+    const visitId = Number(vRes.lastInsertRowid);
+
+    const insRx = db.prepare(`
+      INSERT INTO prescriptions (visit_id, doctor_id, patient_phone, medication_name, dosage, frequency, duration, instructions, is_active)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+    `);
+    for (const rx of (Array.isArray(prescriptions) ? prescriptions : [])) {
+      if (rx && rx.medication_name && rx.medication_name.trim()) {
+        insRx.run(
+          visitId, docId, phone,
+          rx.medication_name.trim(),
+          rx.dosage || 'قرص',
+          rx.frequency || 'يومياً',
+          rx.duration || 'أسبوع',
+          rx.instructions || ''
+        );
+      }
+    }
+
+    logAudit('doctor', `طبيب رقم ${docId}`, 'تسجيل كشف وروشتة', 'medical_visit', visitId, `المريض ${phone}: ${diagnosis}`);
+    res.json({ success: true, message: 'تم حفظ الكشف والروشتة في السجل الطبي بنجاح', visit_id: visitId, ...buildEMRBundle(docId, phone) });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// 4. Add Lab or Radiology Result
+app.post('/api/doctor/:id/emr/patient/:phone/labs', (req, res) => {
+  try {
+    const docId = Number(req.params.id);
+    const phone = decodeURIComponent(req.params.phone || '').trim();
+    const { test_name, category, numeric_value, unit, reference_range, status, result_text, attachment_url, test_date, visit_id } = req.body;
+
+    if (!test_name) {
+      return res.status(400).json({ success: false, message: 'اسم التحليل أو الأشعة مطلوب' });
+    }
+
+    db.prepare(`
+      INSERT INTO lab_results (doctor_id, patient_phone, visit_id, test_name, category, numeric_value, unit, reference_range, status, result_text, attachment_url, test_date)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      docId, phone, visit_id || null, test_name.trim(),
+      category || 'تحليل دم',
+      (numeric_value !== undefined && numeric_value !== null && numeric_value !== '') ? Number(numeric_value) : null,
+      unit || '', reference_range || '', status || 'normal',
+      result_text || '', attachment_url || '',
+      test_date || new Date().toISOString().split('T')[0]
+    );
+
+    logAudit('doctor', `طبيب رقم ${docId}`, 'إضافة نتيجة تحليل/أشعة', 'lab_result', 0, `${test_name} للمريض ${phone}`);
+    res.json({ success: true, message: 'تم إضافة نتيجة التحليل والمقارنة تلقائياً', ...buildEMRBundle(docId, phone) });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// 5. Toggle Prescription Active Status
+app.post('/api/doctor/:id/emr/prescriptions/:prescId/toggle', (req, res) => {
+  try {
+    const docId = Number(req.params.id);
+    const prescId = Number(req.params.prescId);
+    const rx = db.prepare('SELECT * FROM prescriptions WHERE id = ? AND doctor_id = ?').get(prescId, docId);
+    if (!rx) return res.status(404).json({ success: false, message: 'العلاج غير موجود' });
+    const nextState = rx.is_active ? 0 : 1;
+    db.prepare('UPDATE prescriptions SET is_active = ? WHERE id = ?').run(nextState, prescId);
+    res.json({ success: true, is_active: nextState, ...buildEMRBundle(docId, rx.patient_phone) });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// 6. Patient Self-View of Their Own Medical History (Authenticated Patient Only)
+app.get('/api/public/my-emr', (req, res) => {
+  try {
+    if (!req.user || req.user.role !== 'patient' || !req.user.phone) {
+      return res.status(401).json({ success: false, message: 'يرجى تسجيل الدخول بحساب المريض لعرض ملفك الطبي' });
+    }
+    const phone = req.user.phone;
+    const doctorRows = db.prepare(`
+      SELECT DISTINCT v.doctor_id, d.full_name as doctor_name, d.title as doctor_title, s.name as specialty_name
+      FROM medical_visits v
+      JOIN doctors d ON v.doctor_id = d.id
+      LEFT JOIN specialties s ON d.specialty_id = s.id
+      WHERE v.patient_phone = ?
+    `).all(phone);
+
+    const records = doctorRows.map((d) => ({
+      doctor: d,
+      ...buildEMRBundle(d.doctor_id, phone)
+    }));
+    res.json({ success: true, phone, records });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ----------------------------------------------------
+// RECEPTIONIST WHATSAPP LOGGING & ADMIN BACKUP
+// ----------------------------------------------------
+app.post('/api/receptionist/:id/whatsapp-log', (req, res) => {
+  try {
+    const recId = Number(req.params.id);
+    const { patient_name, patient_phone, template_title, message } = req.body;
+    const rec = db.prepare('SELECT * FROM receptionists WHERE id = ?').get(recId);
+    if (!rec) return res.status(404).json({ success: false, message: 'موظف الاستقبال غير موجود' });
+
+    db.prepare(`
+      INSERT INTO notifications (recipient_role, recipient_id, title, message, channel, status)
+      VALUES ('patient', ?, ?, ?, 'whatsapp', 'sent')
+    `).run(
+      patient_phone || '',
+      `واتساب: ${template_title || 'تنبيه عيادة'} — ${patient_name || ''}`,
+      message || ''
+    );
+    logAudit('receptionist', rec.name, 'إرسال رسالة واتساب للمريض', 'notification', recId, `إلى ${patient_name} (${patient_phone})`);
+    res.json({ success: true, message: 'تم توثيق رسالة الواتساب في سجل الإشعارات' });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.get('/api/admin/backup', (req, res) => {
+  try {
+    const dbFile = process.env.DAWRY_DB_PATH || path.join(__dirname, 'dawry.db');
+    if (!fs.existsSync(dbFile)) {
+      return res.status(404).json({ success: false, message: 'ملف قاعدة البيانات غير موجود' });
+    }
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    logAudit('superadmin', 'مدير المنصة', 'تصدير نسخة احتياطية', 'database', 0, 'تحميل نسخة احتياطية لقاعدة البيانات');
+    res.download(dbFile, `dawry-backup-${timestamp}.sqlite`);
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }

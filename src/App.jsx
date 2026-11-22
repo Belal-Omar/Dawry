@@ -104,20 +104,22 @@ export default function App() {
       return;
     }
 
-    // Auto-authenticate demo account for frictionless 1-tap portal preview
-    if (role === 'doctor' && !authenticatedDoctor) {
-      const res = await api.login({ identifier: 'dr.tarek@dawry.com', password: '123456' });
+    // Auto-authenticate demo account for frictionless 1-tap portal preview (issues valid signed token)
+    if (role === 'doctor') {
+      const res = await api.login({ identifier: authenticatedDoctor?.email || 'dr.tarek@dawry.com', password: '123456' });
       if (res && res.success && res.user) {
         setAuthenticatedDoctor(res.user);
         setActiveDoctorId(res.user.id);
         localStorage.setItem('dawry_authenticated_doctor', JSON.stringify(res.user));
       }
-    } else if (role === 'reception' && !authenticatedReceptionist) {
-      const res = await api.login({ identifier: 'reception.tarek@dawry.com', password: '123456' });
+    } else if (role === 'reception') {
+      const res = await api.login({ identifier: authenticatedReceptionist?.email || 'reception.tarek@dawry.com', password: '123456' });
       if (res && res.success && res.user) {
         setAuthenticatedReceptionist(res.user);
         localStorage.setItem('dawry_authenticated_receptionist', JSON.stringify(res.user));
       }
+    } else if (role === 'admin') {
+      await api.login({ identifier: 'admin@dawry.com', password: 'admin123' });
     }
 
     setCurrentRole(role);
@@ -202,6 +204,7 @@ export default function App() {
   const handleDoctorLogout = () => {
     setAuthenticatedDoctor(null);
     localStorage.removeItem('dawry_authenticated_doctor');
+    api.logout();
     showToast('تم تسجيل الخروج من حساب الطبيب بنجاح', 'info');
   };
 
@@ -227,6 +230,7 @@ export default function App() {
   const handleReceptionistLogout = () => {
     setAuthenticatedReceptionist(null);
     localStorage.removeItem('dawry_authenticated_receptionist');
+    api.logout();
     showToast('تم تسجيل الخروج من حساب الاستقبال بنجاح', 'info');
   };
 
