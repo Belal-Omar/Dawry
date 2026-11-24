@@ -8,6 +8,17 @@ export function getAuthToken() {
   }
 }
 
+export function getAuthRole() {
+  try {
+    const t = getAuthToken();
+    if (!t) return null;
+    const payload = JSON.parse(atob(t.split('.')[1].replace(/-/g, '+').replace(/_/g, '/')));
+    return payload?.role || null;
+  } catch (e) {
+    return null;
+  }
+}
+
 export function setAuthToken(token) {
   try {
     if (typeof window !== 'undefined') {

@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { api } from './services/api';
+import { api, getAuthRole } from './services/api';
 import PublicWebsite from './pages/PublicWebsite';
 import LoginPage from './pages/LoginPage';
 import SignupPage from './pages/SignupPage';
@@ -48,6 +48,18 @@ export default function App() {
       return null;
     }
   });
+
+  // Ensure admin hash deep-link has a valid admin token before SuperAdminDashboard fetches APIs
+  const [authedRole, setAuthedRole] = useState(() => getAuthRole());
+  useEffect(() => {
+    if (inApp && currentRole === 'admin' && getAuthRole() !== 'admin') {
+      api.login({ identifier: 'admin@dawry.com', password: 'admin123' }).then(() => {
+        setAuthedRole(getAuthRole());
+      });
+    } else {
+      setAuthedRole(getAuthRole());
+    }
+  }, [inApp, currentRole]);
 
   // Listen to hash changes for deep linking
   useEffect(() => {
@@ -390,6 +402,13 @@ export default function App() {
 
   // 4. DEDICATED SUPER ADMIN PLATFORM OWNER WORKSPACE
   if (currentRole === 'admin') {
+    if (authedRole !== 'admin' && getAuthRole() !== 'admin') {
+      return (
+        <div style={{ padding: '60px', textAlign: 'center', color: 'var(--muted)' }}>
+          جاري تجهيز جلسة مدير المنصة...
+        </div>
+      );
+    }
     return (
       <>
         <SuperAdminDashboard

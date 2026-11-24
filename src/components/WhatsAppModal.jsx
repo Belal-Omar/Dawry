@@ -13,7 +13,8 @@ export function normalizeEgyptianWhatsAppPhone(raw = '') {
   return digits;
 }
 
-const buildTemplates = (ctx = {}) => {
+const buildTemplates = (rawCtx) => {
+  const ctx = rawCtx || {};
   const name = ctx.patientName || 'المريض الكريم';
   const doctor = ctx.doctorName || 'الطبيب';
   const clinic = ctx.clinicName || 'العيادة';
@@ -221,3 +222,4 @@ export default function WhatsAppModal({ isOpen, onClose, context, onSent }) {
     </div>
   );
 }
+
