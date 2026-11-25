@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { api } from '../services/api';
+import { trackMetaEvent } from '../utils/metaPixel';
 import Logo from '../components/Logo';
 import Icon, { SpecialtyIcon, getSpecialtyMeta } from '../components/Icons';
 import ThemeToggle from '../components/ThemeToggle';
@@ -270,6 +271,10 @@ export default function PublicWebsite({ dark, setDark, onOpenApp, showToast }) {
       setTrackQuery(res.booking_code);
       setPage('confirmed');
       window.scrollTo({ top: 0, behavior: 'smooth' });
+      trackMetaEvent('Schedule', {
+        content_name: selectedDoctor?.name || 'Clinic Appointment',
+        content_category: selectedDoctor?.specialty || 'Medical'
+      });
       showToast('تم تأكيد حجزك بنجاح!', 'success');
       loadData();
     } else {

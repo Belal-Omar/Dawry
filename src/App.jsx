@@ -1,5 +1,6 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { api, getAuthRole } from './services/api';
+import { trackMetaPageView } from './utils/metaPixel';
 import PublicWebsite from './pages/PublicWebsite';
 import LoginPage from './pages/LoginPage';
 import SignupPage from './pages/SignupPage';
@@ -72,6 +73,16 @@ export default function App() {
     window.addEventListener('hashchange', handleHashChange);
     return () => window.removeEventListener('hashchange', handleHashChange);
   }, []);
+
+  // Track SPA view transitions in Meta Pixel (skip initial mount already tracked by index.html)
+  const isFirstRender = useRef(true);
+  useEffect(() => {
+    if (isFirstRender.current) {
+      isFirstRender.current = false;
+      return;
+    }
+    trackMetaPageView();
+  }, [currentView, inApp, currentRole]);
 
   // Active doctor for doctor/receptionist workspace
   const [activeDoctorId, setActiveDoctorId] = useState(1);

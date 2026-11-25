@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { api } from '../services/api';
+import { trackMetaEvent } from '../utils/metaPixel';
 import UnifiedNavbar from '../components/UnifiedNavbar';
 import AuthQueueBanner from '../components/AuthQueueBanner';
 
@@ -57,6 +58,7 @@ export default function SignupPage({
         // Save patient local identity
         localStorage.setItem('dawry_patient_name', res.patient?.name || name);
         if (res.patient?.phone) localStorage.setItem('dawry_patient_phone', res.patient.phone);
+        trackMetaEvent('CompleteRegistration', { content_name: 'Patient Signup' });
 
         if (onSignupSuccess) {
           onSignupSuccess(res.patient);
